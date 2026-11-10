@@ -25,7 +25,11 @@ from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
-import lightgbm as lgb
+try:
+    import lightgbm as lgb
+except (ImportError, OSError):
+    lgb = None
+from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 from sklearn.model_selection import TimeSeriesSplit
@@ -46,6 +50,20 @@ import joblib
 # Set random seeds for reproducibility
 np.random.seed(42)
 # tf.random.set_seed(42)  # Commented out due to TensorFlow compatibility
+
+
+def create_lag_features(df, lags=(1, 2, 3, 7, 14), windows=(7, 14, 30)):
+    """Create features using only earlier observations for each store and SKU."""
+    result = df.sort_values(['Store ID', 'Product ID', 'Date']).copy()
+    groups = result.groupby(['Store ID', 'Product ID'], sort=False)
+    for lag in lags:
+        result[f'demand_lag_{lag}'] = groups['Demand'].shift(lag)
+    for window in windows:
+        result[f'demand_rolling_mean_{window}'] = groups['Demand'].transform(
+            lambda series: series.shift(1).rolling(window).mean())
+        result[f'demand_rolling_std_{window}'] = groups['Demand'].transform(
+            lambda series: series.shift(1).rolling(window).std())
+    return result
 
 class RetailDemandForecaster:
     """
@@ -243,25 +261,17 @@ class RetailDemandForecaster:
         
         # Handle missing values
         print("Handling missing values...")
-        self.df = self.df.fillna(method='ffill').fillna(method='bfill')
+        # Future-facing backfill and target-based outlier removal would alter
+        # the holdout distribution. Preserve the observed rows for evaluation.
+        if self.df['Demand'].isna().any():
+            raise ValueError('Demand contains missing values; define a training-only imputation policy')
         
-        # Handle outliers using IQR method
-        print("Handling outliers...")
-        Q1 = self.df['Demand'].quantile(0.25)
-        Q3 = self.df['Demand'].quantile(0.75)
-        IQR = Q3 - Q1
-        lower_bound = Q1 - 1.5 * IQR
-        upper_bound = Q3 + 1.5 * IQR
-        
-        outliers_before = len(self.df)
-        self.df = self.df[(self.df['Demand'] >= lower_bound) & (self.df['Demand'] <= upper_bound)]
-        outliers_after = len(self.df)
-        print(f"Removed {outliers_before - outliers_after} outliers")
+        print('Preserving all observed demand values, including peaks')
         
         # Create hierarchical aggregations
         print("Creating hierarchical aggregations...")
         self.df['Date'] = pd.to_datetime(self.df['Date'])
-        self.df = self.df.set_index('Date')
+        self.df = self.df.sort_values(['Date', 'Store ID', 'Product ID']).set_index('Date')
         
         # Store-SKU level (bottom level)
         store_sku_demand = self.df.groupby(['Store ID', 'Product ID'])['Demand'].resample('D').sum()
@@ -295,15 +305,19 @@ class RetailDemandForecaster:
         
         print("✅ Data preprocessing completed!")
     
-    def calculate_mase(self, actual, forecast, naive_forecast):
-        """Calculate Mean Absolute Scaled Error (MASE)."""
-        mae = np.mean(np.abs(actual - forecast))
-        mae_naive = np.mean(np.abs(actual - naive_forecast))
-        return mae / mae_naive if mae_naive != 0 else np.inf
+    def calculate_mase(self, actual, forecast, training_series):
+        """Scale holdout MAE by one-step naive error on training observations."""
+        train = np.asarray(training_series, dtype=float)
+        if len(train) < 2:
+            return np.nan
+        scale = np.mean(np.abs(np.diff(train)))
+        return np.mean(np.abs(np.asarray(actual) - np.asarray(forecast))) / scale if scale else np.nan
     
     def calculate_smape(self, actual, forecast):
         """Calculate Symmetric Mean Absolute Percentage Error (sMAPE)."""
-        return 100 * np.mean(2 * np.abs(actual - forecast) / (np.abs(actual) + np.abs(forecast)))
+        denominator = np.abs(actual) + np.abs(forecast)
+        return 100 * np.mean(np.divide(2 * np.abs(actual - forecast), denominator,
+                                       out=np.zeros_like(np.asarray(actual, dtype=float)), where=denominator != 0))
     
     def arima_forecasting(self):
         """Implement ARIMA/SARIMAX forecasting."""
@@ -334,7 +348,7 @@ class RetailDemandForecaster:
                 forecast = fitted_model.forecast(steps=len(test_ts))
                 
                 # Calculate metrics
-                mase = self.calculate_mase(test_ts.values, forecast, train_ts.iloc[-1])
+                mase = self.calculate_mase(test_ts.values, forecast, train_ts.values)
                 smape = self.calculate_smape(test_ts.values, forecast)
                 
                 arima_forecasts[sku] = {
@@ -357,24 +371,8 @@ class RetailDemandForecaster:
         """Implement LightGBM forecasting with lag features."""
         print("\n🌳 Implementing LightGBM Forecasting...")
         
-        # Prepare features
-        feature_cols = ['Inventory Level', 'Units Sold', 'Units Ordered', 'Price', 
-                       'Discount', 'Promotion', 'Competitor Pricing']
-        
-        # Create lag features
-        def create_lag_features(df, lags=[1, 2, 3, 7, 14]):
-            df_lagged = df.copy()
-            for lag in lags:
-                df_lagged[f'demand_lag_{lag}'] = df_lagged.groupby(['Store ID', 'Product ID'])['Demand'].shift(lag)
-                df_lagged[f'inventory_lag_{lag}'] = df_lagged.groupby(['Store ID', 'Product ID'])['Inventory Level'].shift(lag)
-            
-            # Rolling features
-            for window in [7, 14, 30]:
-                df_lagged[f'demand_rolling_mean_{window}'] = df_lagged.groupby(['Store ID', 'Product ID'])['Demand'].rolling(window).mean().values
-                df_lagged[f'demand_rolling_std_{window}'] = df_lagged.groupby(['Store ID', 'Product ID'])['Demand'].rolling(window).std().values
-            
-            return df_lagged
-        
+        # Same-day sales and inventory fields are not known at forecast time.
+        feature_cols = []
         # Apply lag features
         df_with_lags = create_lag_features(self.df.reset_index())
         
@@ -389,13 +387,12 @@ class RetailDemandForecaster:
         
         # Prepare features
         all_features = feature_cols + [f'demand_lag_{lag}' for lag in [1, 2, 3, 7, 14]] + \
-                      [f'inventory_lag_{lag}' for lag in [1, 2, 3, 7, 14]] + \
                       [f'demand_rolling_mean_{window}' for window in [7, 14, 30]] + \
                       [f'demand_rolling_std_{window}' for window in [7, 14, 30]] + \
                       ['Store ID_encoded', 'Product ID_encoded', 'Category_encoded']
         
         # Remove rows with NaN values (from lag features)
-        df_clean = df_with_lags.dropna()
+        df_clean = df_with_lags.dropna(subset=all_features + ['Demand'])
         
         # Split data
         split_date = df_clean['Date'].max() - pd.DateOffset(months=3)
@@ -407,14 +404,13 @@ class RetailDemandForecaster:
         X_test = test_data[all_features]
         y_test = test_data['Demand']
         
-        # Train LightGBM model
-        lgb_model = lgb.LGBMRegressor(
-            n_estimators=100,
-            learning_rate=0.1,
-            max_depth=6,
-            random_state=42,
-            verbose=-1
-        )
+        # Use a portable sklearn fallback where the LightGBM native runtime is unavailable.
+        model_name = 'LightGBM' if lgb is not None else 'HistGradientBoosting'
+        lgb_model = (lgb.LGBMRegressor(n_estimators=100, learning_rate=0.1,
+                                      max_depth=6, random_state=42, verbose=-1)
+                     if lgb is not None else
+                     HistGradientBoostingRegressor(max_iter=100, learning_rate=0.1,
+                                                   max_depth=6, random_state=42))
         
         lgb_model.fit(X_train, y_train)
         
@@ -422,22 +418,34 @@ class RetailDemandForecaster:
         y_pred = lgb_model.predict(X_test)
         
         # Calculate metrics
-        mase = self.calculate_mase(y_test.values, y_pred, y_train.iloc[-len(y_test):].values)
+        train_scales = train_data.sort_values('Date').groupby(['Store ID', 'Product ID'])['Demand'].apply(
+            lambda values: values.diff().abs().mean()).dropna()
+        naive_scale = train_scales.mean()
+        mase = np.mean(np.abs(y_test.values - y_pred)) / naive_scale if naive_scale else np.nan
+        naive_pred = test_data['demand_lag_7'].to_numpy()
+        naive_mae = mean_absolute_error(y_test, naive_pred)
+        naive_rmse = np.sqrt(mean_squared_error(y_test, naive_pred))
         smape = self.calculate_smape(y_test.values, y_pred)
         rmse = np.sqrt(mean_squared_error(y_test, y_pred))
         mae = mean_absolute_error(y_test, y_pred)
         
         self.models['lightgbm'] = {
             'model': lgb_model,
+            'model_name': model_name,
+            'seasonal_naive_mae': naive_mae,
+            'seasonal_naive_rmse': naive_rmse,
+            'seasonal_naive_mase': naive_mae / naive_scale if naive_scale else np.nan,
+            'seasonal_naive_smape': self.calculate_smape(y_test.values, naive_pred),
             'predictions': y_pred,
             'actual': y_test.values,
+            'test_keys': test_data[['Date', 'Store ID', 'Product ID']].reset_index(drop=True),
             'mase': mase,
             'smape': smape,
             'rmse': rmse,
             'mae': mae
         }
         
-        print(f"LightGBM Results: MASE={mase:.3f}, sMAPE={smape:.3f}, RMSE={rmse:.3f}, MAE={mae:.3f}")
+        print(f"{model_name} Results: MASE={mase:.3f}, sMAPE={smape:.3f}, RMSE={rmse:.3f}, MAE={mae:.3f}; observed-history lag-7 naive MAE={naive_mae:.3f}")
         print("✅ LightGBM forecasting completed!")
     
     def lstm_forecasting(self):
@@ -489,7 +497,7 @@ class RetailDemandForecaster:
         y_pred_seq = model.predict(X_test_seq)
         
         # Calculate metrics
-        mase = self.calculate_mase(y_test_seq, y_pred_seq, y_train_seq[-len(y_test_seq):])
+        mase = self.calculate_mase(y_test_seq, y_pred_seq, y_train_seq)
         smape = self.calculate_smape(y_test_seq, y_pred_seq)
         rmse = np.sqrt(mean_squared_error(y_test_seq, y_pred_seq))
         mae = mean_absolute_error(y_test_seq, y_pred_seq)
@@ -508,28 +516,21 @@ class RetailDemandForecaster:
         print("✅ Sequence-based forecasting completed!")
     
     def hierarchical_reconciliation(self):
-        """Apply hierarchical reconciliation to forecasts."""
-        print("\n🔗 Applying Hierarchical Reconciliation...")
-        
-        # Simple bottom-up reconciliation
-        # In practice, you would use more sophisticated methods like scikit-hts
-        
-        reconciled_forecasts = {}
-        
-        # For demonstration, we'll reconcile LightGBM forecasts
-        if 'lightgbm' in self.models:
-            lgb_results = self.models['lightgbm']
-            
-            # Get store-SKU level forecasts
-            store_sku_forecasts = {}
-            
-            # This is a simplified reconciliation
-            # In practice, you would implement proper hierarchical reconciliation
-            reconciled_forecasts['lightgbm'] = lgb_results
-            
-            print("✅ Hierarchical reconciliation completed!")
-        
-        self.forecasts['reconciled'] = reconciled_forecasts
+        """Aggregate bottom-level predictions into coherent daily totals."""
+        if 'lightgbm' not in self.models:
+            raise ValueError('Fit bottom-level LightGBM forecasts first')
+        result = self.models['lightgbm']
+        bottom = result['test_keys'].copy()
+        bottom['Predicted'] = result['predictions']
+        bottom['Actual'] = result['actual']
+        levels = {
+            'bottom': bottom,
+            'store': bottom.groupby(['Date', 'Store ID'], as_index=False)[['Predicted', 'Actual']].sum(),
+            'product': bottom.groupby(['Date', 'Product ID'], as_index=False)[['Predicted', 'Actual']].sum(),
+            'total': bottom.groupby('Date', as_index=False)[['Predicted', 'Actual']].sum(),
+        }
+        self.forecasts['reconciled'] = levels
+        return levels
     
     def evaluate_models(self):
         """Evaluate all models and compare performance."""
@@ -539,12 +540,19 @@ class RetailDemandForecaster:
         
         for model_name, model_results in self.models.items():
             if isinstance(model_results, dict) and 'mase' in model_results:
-                evaluation_results[model_name] = {
+                evaluation_results[model_results.get('model_name', model_name)] = {
                     'MASE': model_results['mase'],
                     'sMAPE': model_results['smape'],
                     'RMSE': model_results.get('rmse', np.nan),
                     'MAE': model_results.get('mae', np.nan)
                 }
+                if 'seasonal_naive_mae' in model_results:
+                    evaluation_results['Observed-history lag-7 naive'] = {
+                        'MASE': model_results['seasonal_naive_mase'],
+                        'sMAPE': model_results['seasonal_naive_smape'],
+                        'RMSE': model_results['seasonal_naive_rmse'],
+                        'MAE': model_results['seasonal_naive_mae'],
+                    }
         
         # Create comparison table
         comparison_df = pd.DataFrame(evaluation_results).T
@@ -795,7 +803,8 @@ class RetailDemandForecaster:
         # Step 4: Forecasting models
         self.arima_forecasting()
         self.lightgbm_forecasting()
-        self.lstm_forecasting()  # Now uses simplified sequence model
+        # The legacy sequence demonstration splits pooled SKU windows by row,
+        # so it is excluded from validated model comparisons.
         
         # Step 5: Hierarchical reconciliation
         self.hierarchical_reconciliation()
@@ -803,9 +812,9 @@ class RetailDemandForecaster:
         # Step 6: Evaluation
         self.evaluate_models()
         
-        # Step 7: Safety stock calculation
-        self.safety_stock_calculator()
-        
+        # Safety-stock recommendations require a validated lead-time model and
+        # service-level assumptions, so the legacy calculation is excluded.
+
         # Step 8: Visualizations
         self.create_forecast_visualizations()
         
@@ -816,7 +825,6 @@ class RetailDemandForecaster:
         print("=" * 60)
         print("📁 All visualizations saved in 'visualizations/' folder")
         print("📁 Results exported to CSV files")
-        print("📁 Safety stock recommendations available")
 
 
 def main():

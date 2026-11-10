@@ -1,3 +1,5 @@
+> Historical project note: performance values and method claims in this file predate the leakage correction. See README.md for the current validation status.
+
 # 🚀 GitHub Repository Setup Guide
 
 ## Step-by-Step Instructions to Upload Your Retail Forecasting Project

@@ -128,3 +128,6 @@ tmp/
 !*.csv
 !*.png
 !*.md
+
+.pytest_cache/
+visualizations/

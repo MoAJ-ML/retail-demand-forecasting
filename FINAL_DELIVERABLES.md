@@ -1,3 +1,5 @@
+> Historical project note: performance values and method claims in this file predate the leakage correction. See README.md for the current validation status.
+
 # 🎉 FINAL DELIVERABLES - Retail Demand Forecasting Project
 
 ## ✅ **PROJECT COMPLETED SUCCESSFULLY**
