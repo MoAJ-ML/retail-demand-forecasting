@@ -776,11 +776,10 @@ class RetailDemandForecaster:
         # Export forecasts (if available)
         if 'lightgbm' in self.models:
             lgb_results = self.models['lightgbm']
-            forecast_df = pd.DataFrame({
-                'Actual': lgb_results['actual'],
-                'Predicted': lgb_results['predictions'],
-                'Residual': lgb_results['actual'] - lgb_results['predictions']
-            })
+            forecast_df = lgb_results['test_keys'].copy()
+            forecast_df['Actual'] = lgb_results['actual']
+            forecast_df['Predicted'] = lgb_results['predictions']
+            forecast_df['Residual'] = forecast_df['Actual'] - forecast_df['Predicted']
             forecast_df.to_csv('forecast_results.csv', index=False)
             print("📁 Forecast results saved to 'forecast_results.csv'")
         
