@@ -16,6 +16,7 @@ python -m unittest discover -s tests
 ```
 
 The full script writes plots under `visualizations/`, `model_performance_metrics.csv`, and `forecast_results.csv`. Run from the repository root. Its legacy EDA and ARIMA stages can be slow on the full dataset.
+The base requirements install the portable sklearn fallback. Install optional LightGBM separately only when its native OpenMP runtime is available. The PR smoke workflow checks leakage and aggregation using synthetic data.
 
 ## Validation protocol
 
